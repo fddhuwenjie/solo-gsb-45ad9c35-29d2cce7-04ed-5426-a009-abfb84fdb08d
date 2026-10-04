@@ -22,6 +22,10 @@
   （有限正 `scale`/`offset`），分析可选按档案以 `corrected=raw*scale+offset`
   校准后再检测；档案标识与内容进入请求哈希与 `analysis_digest`，历史回放、
   处置复核与联单核对始终基于同一份不可变档案
+- 🧪 校准档案拟更正预演：提交已有 `profile_id`、拟替换的生效区间与该档案下
+  1～20 个批次，服务在同一 SQLite 读取快照内分别用原档案与拟定区间重算
+  各批次异常与 `analysis_digest`，返回两份摘要、异常数与变化标记，并对
+  摘要变化的批次列出需重新核对的处置案件与运输联单；纯只读，不落库
 - 🗄️ SQLite 持久化（WAL 模式），无外部服务依赖
 - 📦 本地依赖：所有 wheel 在 `vendor/` 内，镜像构建**不需要访问外网 PyPI**
 
@@ -40,6 +44,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/batches/analyze | 提交分析（POST） |
 | http://localhost:8000/api/v1/batches/{batch_id} | 回放批次结果（GET） |
 | http://localhost:8000/api/v1/calibration-profiles | 设备温度校准档案（POST） |
+| http://localhost:8000/api/v1/calibration-profiles/correction-preview | 校准档案拟更正预演（POST，只读） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
 | http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
 
@@ -304,6 +309,85 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
   完全沿用旧口径，峰值为原始温度，`request_hash` 与 `analysis_digest`
   与升级前逐字节一致。
 
+## 校准档案拟更正预演
+
+档案不可变，但探头系数可能需要更正。正式换档前，调用方可先通过
+`POST /api/v1/calibration-profiles/correction-preview` **预演**：提交已有
+`profile_id`、拟替换的生效区间（遵循建档规则）以及该档案下 **1～20 个
+不重复** `batch_id`。服务在**同一 SQLite 读取快照**内，依据每批保存的
+原始采样与区段，分别用**原档案**与**拟定区间**重算异常与
+`analysis_digest`，按批次返回两份摘要、异常数与变化标记；仅对摘要变化
+的批次，列出绑定旧摘要的 `case_id` 与关联的 `shipment_id`（分别排序
+去重）——这些处置与联单在正式换档后需要重新核对。档案内容本身即进入
+摘要，因此**即使重算后的异常列表未变，只要拟定区间与原档案不同，摘要
+就会变化并列入受影响清单**。预演为纯只读操作：不修改档案、批次、处置
+与联单，也不产生任何幂等记录。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/calibration-profiles/correction-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "profile_id": "CAL-2026-Q3-007",
+    "intervals": [
+      {"start": "2026-09-01T00:00:00Z", "end": "2026-10-01T00:00:00Z",
+       "scale": 1.01, "offset": 0.20}
+    ],
+    "batch_ids": ["TRIP-CAL-001"]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `profile_id` | 已有校准档案号；不存在返回 `409` |
+| `intervals` | 拟替换的生效区间（遵循建档规则：按时间排序、互不重叠的 `[start,end)`，有限正 `scale`/`offset`） |
+| `batch_ids` | 该档案下待核对的批次号，1～20 个且不可重复；批次不存在返回 `404` |
+
+响应（`TRIP-CAL-001` 摘要变化，其处置案件与联单需重新核对）：
+
+```json
+{
+  "profile_id": "CAL-2026-Q3-007",
+  "device_id": "reefer-A-17",
+  "batches": [
+    {
+      "batch_id": "TRIP-CAL-001",
+      "anomaly_count_current": 1,
+      "anomaly_count_proposed": 1,
+      "analysis_digest_current": "a1f9…（原档案重算摘要，处置/联单当前绑定值）",
+      "analysis_digest_proposed": "c4d2…（拟定区间重算摘要）",
+      "digest_changed": true,
+      "affected_case_ids": ["CASE-2026-09-22-01"],
+      "affected_shipment_ids": ["SHP-2026-09-22-01"]
+    }
+  ]
+}
+```
+
+响应字段与语义：
+
+- `anomaly_count_current` / `anomaly_count_proposed`：原档案与拟定区间
+  各自重算的异常数。
+- `analysis_digest_current` / `analysis_digest_proposed`：两份重算摘要；
+  前者与 `GET /api/v1/batches/{batch_id}` 的实时重算结果一致。
+- `digest_changed`：两份摘要是否不同；拟定区间与原档案逐字节相同时为
+  `false`，受影响清单为空。
+- `affected_case_ids` / `affected_shipment_ids`：仅 `digest_changed=true`
+  时列出——绑定**旧摘要**（`analysis_digest_current`）的处置案件号与
+  运输联单号，分别排序去重；绑定其他（过期）摘要的记录不在其列。
+
+错误码（任一校验失败即**整次拒绝**，不返回部分结果）：
+
+- **档案缺失 `409`**：`profile_id` 不存在。
+- **批次缺失 `404`**：任一 `batch_id` 不存在（详情指明批次号）。
+- **设备/档案不匹配 `409`**：批次 `device_id` 与档案所属设备不一致，
+  或批次绑定的档案（含未绑定）与 `profile_id` 不一致。
+- **拟定区间漏采样 `422`**：任一批次的任一采样时刻不被拟定区间覆盖
+  （详情指明批次与采样时刻）。
+- **结构校验 `422`**：批次号重复、数量越界（空或超过 20）、区间重叠、
+  `end <= start`、非正/非有限系数。
+
 ## 处置复核（绑定分析快照）
 
 处置接口为 `POST /api/v1/cases/review`。客户端先做分析、拿到
@@ -522,11 +606,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、复核/联单事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、拟更正预演、复核/联单事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因/校准算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
 │   └── db.py          # SQLite 连接、建表、批次/案件/联单/档案读写与事务
-├── tests/             # unittest 算法与 API 测试（86 个用例，含校准档案、快照绑定、复核与联单幂等）
+├── tests/             # unittest 算法与 API 测试（101 个用例，含校准档案、拟更正预演、快照绑定、复核与联单幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

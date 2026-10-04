@@ -55,6 +55,22 @@ def transaction() -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+@contextmanager
+def read_snapshot() -> Iterator[sqlite3.Connection]:
+    """打开一个只读事务：同一 SQLite 读取快照，绝不写入、不拿写锁。
+
+    WAL 模式下读事务看到一致快照且不阻塞写者；结束时一律回滚，
+    供拟更正预演等纯查询路径使用。
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(_DB_PATH)), exist_ok=True)
     with _connect() as conn:
@@ -472,6 +488,32 @@ def get_profile(profile_id: str) -> Optional[dict[str, Any]]:
     finally:
         conn.close()
     return result
+
+
+def select_case_ids_bound_to_digest(
+    conn: sqlite3.Connection, batch_id: str, analysis_digest: str
+) -> list[str]:
+    """事务内查询：该批次下绑定指定分析摘要的处置案件号（排序去重）。"""
+    rows = conn.execute(
+        """SELECT DISTINCT case_id FROM cases
+           WHERE batch_id = ? AND analysis_digest = ?
+           ORDER BY case_id""",
+        (batch_id, analysis_digest),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def select_shipment_ids_bound_to_digest(
+    conn: sqlite3.Connection, batch_id: str, analysis_digest: str
+) -> list[str]:
+    """事务内查询：该批次下绑定指定分析摘要的运输联单号（排序去重）。"""
+    rows = conn.execute(
+        """SELECT DISTINCT shipment_id FROM shipment_batches
+           WHERE batch_id = ? AND analysis_digest = ?
+           ORDER BY shipment_id""",
+        (batch_id, analysis_digest),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def save_profile(

@@ -7,9 +7,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 SegmentType = Literal["loading", "unloading", "transport"]
 
@@ -64,6 +71,25 @@ class CalibrationIntervalIn(BaseModel):
     offset: float = Field(..., gt=0, description="校准偏移（有限正数）")
 
 
+def _order_and_validate_intervals(
+    intervals: list[CalibrationIntervalIn],
+) -> list[CalibrationIntervalIn]:
+    """建档规则：按开始时间排序、互不重叠（允许首尾相接）的 [start,end) 区间。
+
+    建档与拟更正预演共用同一套校验，保证拟定区间与原档案口径一致。
+    """
+    ordered = sorted(intervals, key=lambda iv: to_epoch(iv.start))
+    for index, iv in enumerate(ordered, start=1):
+        start, end = to_epoch(iv.start), to_epoch(iv.end)
+        if end <= start:
+            raise ValueError(f"校准区间 {index} 的 end 必须晚于 start")
+        if index > 1:
+            prev_end = to_epoch(ordered[index - 2].end)
+            if prev_end > start:
+                raise ValueError(f"校准区间 {index - 1} 与 {index} 时间重叠")
+    return ordered
+
+
 class CalibrationProfileIn(BaseModel):
     """设备温度校准档案提交：按时间排序、互不重叠的 [start,end) 生效区间。"""
 
@@ -78,16 +104,9 @@ class CalibrationProfileIn(BaseModel):
 
     @model_validator(mode="after")
     def _validate_intervals(self) -> "CalibrationProfileIn":
-        ordered = sorted(self.intervals, key=lambda iv: to_epoch(iv.start))
-        for index, iv in enumerate(ordered, start=1):
-            start, end = to_epoch(iv.start), to_epoch(iv.end)
-            if end <= start:
-                raise ValueError(f"校准区间 {index} 的 end 必须晚于 start")
-            if index > 1:
-                prev_end = to_epoch(ordered[index - 2].end)
-                if prev_end > start:
-                    raise ValueError(f"校准区间 {index - 1} 与 {index} 时间重叠")
-        object.__setattr__(self, "intervals", ordered)
+        object.__setattr__(
+            self, "intervals", _order_and_validate_intervals(self.intervals)
+        )
         return self
 
 
@@ -103,6 +122,79 @@ class CalibrationProfileResponse(BaseModel):
     profile_id: str
     cached: bool = Field(..., description="true 表示相同档案号同内容幂等回放")
     intervals: list[CalibrationIntervalOut]
+
+
+# ---------- 校准档案拟更正预演 ----------
+
+
+class ProfileCorrectionPreviewRequest(BaseModel):
+    """校准档案拟更正预演：已有档案 + 拟替换生效区间 + 待核对批次清单。
+
+    预演为纯只读操作：不修改档案、批次、处置与联单，仅按拟定区间重算并
+    返回两份摘要的差异与受影响的处置/联单。
+    """
+
+    profile_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="已有校准档案号；预演只读，不修改档案",
+    )
+    intervals: list[CalibrationIntervalIn] = Field(
+        ..., min_length=1,
+        description="拟替换的生效区间（遵循建档规则：按时间排序、互不重叠、有限正系数）",
+    )
+    batch_ids: list[
+        Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    ] = Field(
+        ..., min_length=1, max_length=20,
+        description="该档案下待核对的批次号（1~20 个，不可重复）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_preview(self) -> "ProfileCorrectionPreviewRequest":
+        object.__setattr__(
+            self, "intervals", _order_and_validate_intervals(self.intervals)
+        )
+        if len(set(self.batch_ids)) != len(self.batch_ids):
+            raise ValueError("batch_ids 中批次号不能重复")
+        return self
+
+
+class CorrectionPreviewBatchOut(BaseModel):
+    batch_id: str
+    anomaly_count_current: int = Field(
+        ..., description="按原档案重算的当前异常数"
+    )
+    anomaly_count_proposed: int = Field(
+        ..., description="按拟定档案重算的异常数"
+    )
+    analysis_digest_current: str = Field(
+        ..., description="按原档案重算的分析摘要（旧摘要，处置/联单当前绑定值）"
+    )
+    analysis_digest_proposed: str = Field(
+        ..., description="按拟定档案重算的分析摘要"
+    )
+    digest_changed: bool = Field(
+        ...,
+        description=(
+            "两份摘要是否不同；档案内容改变即置真，即使重算后的异常列表未变"
+        ),
+    )
+    affected_case_ids: list[str] = Field(
+        ...,
+        description="仅摘要变化时列出：绑定旧摘要的处置案件号（排序去重），否则为空",
+    )
+    affected_shipment_ids: list[str] = Field(
+        ...,
+        description="仅摘要变化时列出：绑定旧摘要的运输联单号（排序去重），否则为空",
+    )
+
+
+class ProfileCorrectionPreviewResponse(BaseModel):
+    profile_id: str
+    device_id: str = Field(..., description="档案所属设备")
+    batches: list[CorrectionPreviewBatchOut] = Field(
+        ..., description="按提交顺序逐批次返回两份摘要、异常数与变化标记"
+    )
 
 
 class AnalysisRequest(BaseModel):

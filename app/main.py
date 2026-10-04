@@ -32,7 +32,10 @@ from .models import (
     CalibrationIntervalOut,
     CaseReviewRequest,
     CaseReviewResponse,
+    CorrectionPreviewBatchOut,
     DecisionOut,
+    ProfileCorrectionPreviewRequest,
+    ProfileCorrectionPreviewResponse,
     ShipmentBatchOut,
     ShipmentSnapshotRequest,
     ShipmentSnapshotResponse,
@@ -49,7 +52,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
@@ -57,7 +60,8 @@ app = FastAPI(
         "可选设备温度校准档案：按采样时刻以 raw*scale+offset 校准后检测，"
         "档案标识与内容进入请求哈希与分析摘要。处置复核绑定分析快照；"
         "运输联单在同一事务内逐批次核对快照与案件处置后落库，"
-        "给出 released/held 风险结论。"
+        "给出 released/held 风险结论。校准档案拟更正预演在同一读取快照内"
+        "以原档案与拟定区间分别重算各批次摘要，列出需重新核对的处置与联单。"
     ),
     lifespan=lifespan,
 )
@@ -230,6 +234,8 @@ def _analysis_digest(
 def _run_detection(
     req: AnalysisRequest,
     profile_descriptor: Optional[dict[str, Any]] = None,
+    *,
+    gap_context: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     samples = [
         Sample(timestamp=to_epoch(s.timestamp), temperature=s.temperature)
@@ -242,14 +248,18 @@ def _run_detection(
         try:
             samples = apply_calibration(samples, intervals)
         except CalibrationGapError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
+            if gap_context is None:
+                detail = (
                     f"采样时刻 {from_epoch(exc.timestamp)} 未被校准档案 "
                     f"{req.profile_id} 的任何 [start,end) 生效区间覆盖；"
                     "整批不得写入，请补齐档案后重试"
-                ),
-            ) from exc
+                )
+            else:
+                detail = (
+                    f"{gap_context}：采样时刻 {from_epoch(exc.timestamp)} 未被"
+                    "拟定校准区间的任何 [start,end) 生效区间覆盖；整次预演拒绝"
+                )
+            raise HTTPException(status_code=422, detail=detail) from exc
     segments = [
         Segment(
             segment_id=s.segment_id,
@@ -641,6 +651,136 @@ def submit_calibration_profile(
                 for start, end, scale, offset in intervals
             ],
         )
+
+
+# ---------- 校准档案拟更正预演 ----------
+
+
+def _proposed_descriptor(
+    req: ProfileCorrectionPreviewRequest,
+) -> dict[str, Any]:
+    """拟定档案的确定结构：与库存档案同一摘要口径（profile_id + 区间与系数）。"""
+    return {
+        "profile_id": req.profile_id,
+        "intervals": [
+            {
+                "start": to_epoch(iv.start),
+                "end": to_epoch(iv.end),
+                "scale": iv.scale,
+                "offset": iv.offset,
+            }
+            for iv in req.intervals
+        ],
+    }
+
+
+@app.post(
+    "/api/v1/calibration-profiles/correction-preview",
+    response_model=ProfileCorrectionPreviewResponse,
+)
+def preview_profile_correction(
+    req: ProfileCorrectionPreviewRequest,
+) -> ProfileCorrectionPreviewResponse:
+    """校准档案拟更正预演（纯只读）：评估换档对既有批次、处置与联单的影响。
+
+    在**同一 SQLite 读取快照**内，依据每批保存的原始采样与区段，分别用
+    库中原档案与提交的拟定区间重算异常与 ``analysis_digest``，按批次返回
+    两份摘要、异常数与变化标记；仅对摘要变化的批次，列出绑定旧摘要的
+    ``case_id`` 与关联的 ``shipment_id``（分别排序去重）——档案内容改变
+    即导致摘要变化，即使重算后的异常列表未变也须列入。
+
+    档案或批次不存在、批次设备或绑定档案与 ``profile_id`` 不匹配、拟定
+    区间漏掉任一批次的任一采样时，指出对应对象并**整次拒绝**（409/404/
+    422）。预演不修改档案、批次、处置与联单，也不产生任何幂等记录。
+    """
+    with db.read_snapshot() as conn:
+        profile = db.get_profile_for_update(conn, req.profile_id)
+        if profile is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"profile_id={req.profile_id} 不存在，"
+                    "请先提交设备温度校准档案"
+                ),
+            )
+        device_id = profile["profile"]["device_id"]
+        descriptor_current = _profile_descriptor(profile)
+        descriptor_proposed = _proposed_descriptor(req)
+
+        batches_out: list[CorrectionPreviewBatchOut] = []
+        for batch_id in req.batch_ids:
+            batch_row = db._select_batch(conn, batch_id)
+            if batch_row is None:
+                raise HTTPException(
+                    status_code=404, detail=f"批次 {batch_id} 不存在"
+                )
+            batch = dict(batch_row)
+            if batch["device_id"] != device_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"批次 {batch_id} 属于设备 {batch['device_id']}，"
+                        f"与档案 {req.profile_id} 所属设备 {device_id} 不匹配"
+                    ),
+                )
+            if batch.get("profile_id") != req.profile_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"批次 {batch_id} 绑定的校准档案为 "
+                        f"{batch.get('profile_id') or '（未绑定档案）'}，"
+                        f"与拟更正档案 {req.profile_id} 不匹配"
+                    ),
+                )
+            stored = {
+                "batch": batch,
+                "anomalies": db._select_anomalies(conn, batch_id),
+            }
+            stored_req = _request_from_stored(stored)
+
+            # 同一读取快照内分别按原档案与拟定区间重算；预演只读，
+            # 不做 _recompute_batch_conn 的旧口径覆盖写回。
+            anomalies_current = _run_detection(stored_req, descriptor_current)
+            digest_current = _analysis_digest(
+                anomalies_current, descriptor_current
+            )
+            anomalies_proposed = _run_detection(
+                stored_req,
+                descriptor_proposed,
+                gap_context=f"批次 {batch_id}",
+            )
+            digest_proposed = _analysis_digest(
+                anomalies_proposed, descriptor_proposed
+            )
+
+            changed = digest_current != digest_proposed
+            case_ids: list[str] = []
+            shipment_ids: list[str] = []
+            if changed:
+                case_ids = db.select_case_ids_bound_to_digest(
+                    conn, batch_id, digest_current
+                )
+                shipment_ids = db.select_shipment_ids_bound_to_digest(
+                    conn, batch_id, digest_current
+                )
+            batches_out.append(
+                CorrectionPreviewBatchOut(
+                    batch_id=batch_id,
+                    anomaly_count_current=len(anomalies_current),
+                    anomaly_count_proposed=len(anomalies_proposed),
+                    analysis_digest_current=digest_current,
+                    analysis_digest_proposed=digest_proposed,
+                    digest_changed=changed,
+                    affected_case_ids=case_ids,
+                    affected_shipment_ids=shipment_ids,
+                )
+            )
+
+    return ProfileCorrectionPreviewResponse(
+        profile_id=req.profile_id,
+        device_id=device_id,
+        batches=batches_out,
+    )
 
 
 # ---------- 处置复核 ----------
