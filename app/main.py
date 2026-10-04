@@ -33,6 +33,10 @@ from .models import (
     CaseReviewRequest,
     CaseReviewResponse,
     DecisionOut,
+    DigestSnapshotOut,
+    ProfileCorrectionBatchOut,
+    ProfileCorrectionPreviewRequest,
+    ProfileCorrectionPreviewResponse,
     ShipmentBatchOut,
     ShipmentSnapshotRequest,
     ShipmentSnapshotResponse,
@@ -49,7 +53,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
@@ -57,7 +61,9 @@ app = FastAPI(
         "可选设备温度校准档案：按采样时刻以 raw*scale+offset 校准后检测，"
         "档案标识与内容进入请求哈希与分析摘要。处置复核绑定分析快照；"
         "运输联单在同一事务内逐批次核对快照与案件处置后落库，"
-        "给出 released/held 风险结论。"
+        "给出 released/held 风险结论。校准档案更正前提供只读预演："
+        "在同一 SQLite 读取快照内用原档案与拟定档案分别重算所列批次，"
+        "给出摘要变化标记及需重新核对的处置案件与运输联单。"
     ),
     lifespan=lifespan,
 )
@@ -360,6 +366,75 @@ def _recompute_batch_conn(
         db._replace_anomalies_conn(conn, req.batch_id, fresh)
 
     return req.device_id, fresh, descriptor
+
+
+def _preview_detection(
+    req: AnalysisRequest,
+    descriptor: Optional[dict[str, Any]],
+    *,
+    batch_label: str,
+) -> list[dict[str, Any]]:
+    """预演专用检测：与 :func:`_run_detection` 同口径，但为只读路径——
+
+    拟定区间漏掉任一采样（:class:`CalibrationGapError`）时返回 422，错误
+    详情定位到具体批次与采样时刻。不读写异常表，不产生任何持久化副作用。
+    """
+    samples = [
+        Sample(timestamp=to_epoch(s.timestamp), temperature=s.temperature)
+        for s in req.samples
+    ]
+    intervals = _calibration_intervals(descriptor)
+    if intervals is not None:
+        try:
+            samples = apply_calibration(samples, intervals)
+        except CalibrationGapError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"批次 {batch_label} 的采样时刻 {from_epoch(exc.timestamp)} "
+                    f"未被拟定校准区间的任何 [start,end) 生效区间覆盖；"
+                    "拟定区间漏掉该采样，整次预演拒绝，请补齐区间后重试"
+                ),
+            ) from exc
+    segments = [
+        Segment(
+            segment_id=s.segment_id,
+            segment_type=s.segment_type,
+            start=to_epoch(s.start),
+            end=to_epoch(s.end),
+            lower_limit=s.lower_limit,
+            upper_limit=s.upper_limit,
+        )
+        for s in req.segments
+    ]
+    anomalies = detect_anomalies(
+        device_id=req.device_id,
+        samples=samples,
+        segments=segments,
+        gap_seconds=req.gap_seconds,
+        dip_tolerance_seconds=req.dip_tolerance_seconds,
+    )
+    return [_anomaly_to_internal(a) for a in anomalies]
+
+
+def _proposed_profile_descriptor(
+    profile_id: str, intervals: list[Any]
+) -> dict[str, Any]:
+    """拟定档案描述：沿用原 profile_id，区间替换为请求中按建档规则排序后
+    的生效区间。结构与 :func:`_profile_descriptor` 逐字段一致，保证摘要口径
+    （{"anomalies": ..., "profile": ...}）与原档案完全可比。"""
+    return {
+        "profile_id": profile_id,
+        "intervals": [
+            {
+                "start": to_epoch(iv.start),
+                "end": to_epoch(iv.end),
+                "scale": iv.scale,
+                "offset": iv.offset,
+            }
+            for iv in intervals
+        ],
+    }
 
 
 def _build_response(
@@ -1031,3 +1106,160 @@ def create_shipment_snapshot(
             cached=False,
         )
     return result_body
+
+
+# ---------- 校准档案更正预演（只读） ----------
+
+
+@app.post(
+    "/api/v1/calibration-profiles/correction-preview",
+    response_model=ProfileCorrectionPreviewResponse,
+)
+def preview_profile_correction(
+    req: ProfileCorrectionPreviewRequest,
+) -> ProfileCorrectionPreviewResponse:
+    """校准档案拟更正前的只读预演：哪些已完成处置与联单需要重新核对。
+
+    服务在**同一 SQLite 事务读取快照**内：读取该设备不可变原档案 → 对
+    ``batch_ids`` 中每个批次依据保存的原始采样与区段，分别用**原档案**与
+    **拟定档案**（区间替换、profile_id 不变）重算异常与 ``analysis_digest``，
+    按 batch_id 返回两份摘要、异常数与变化标记。仅对摘要变化的批次，列出
+    绑定旧摘要的 ``case_id`` 及关联的 ``shipment_id``（各自排序去重）；
+    异常列表未变但档案内容变化导致摘要变化也列入。
+
+    整次拒绝（不落任何写操作）：档案不存在 / 批次不存在 / 批次档案或设备
+    不匹配（指出对应对象）/ 拟定区间漏掉任一批次的任一采样（422，指出批次
+    与采样时刻）。预演不修改档案、批次、处置与联单；现有接口及幂等行为不变。
+    """
+    with db.transaction() as conn:
+        profile = db.get_profile_for_update(conn, req.profile_id)
+        if profile is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"profile_id={req.profile_id} 不存在，请先提交设备温度"
+                    "校准档案后再预演更正"
+                ),
+            )
+        device_id = profile["profile"]["device_id"]
+        current_descriptor = _profile_descriptor(profile)
+        proposed_descriptor = _proposed_profile_descriptor(
+            req.profile_id, req.intervals
+        )
+
+        # 先整批核对对象存在性与归属：缺失批次 404、档案/设备不匹配 409。
+        stored_by_batch: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        mismatches: list[str] = []
+        for batch_id in req.batch_ids:
+            batch_row = db._select_batch(conn, batch_id)
+            if batch_row is None:
+                missing.append(batch_id)
+                continue
+            stored_by_batch[batch_id] = {
+                "batch": dict(batch_row),
+                "anomalies": db._select_anomalies(conn, batch_id),
+            }
+            if batch_row["profile_id"] != req.profile_id:
+                mismatches.append(
+                    f"batch_id={batch_id} 绑定的是 "
+                    f"profile_id={batch_row['profile_id']}，与本次预演档案 "
+                    f"{req.profile_id} 不匹配"
+                )
+            elif batch_row["device_id"] != device_id:
+                mismatches.append(
+                    f"batch_id={batch_id} 属于设备 {batch_row['device_id']}，"
+                    f"与档案 {req.profile_id} 的设备 {device_id} 不匹配"
+                )
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "以下批次不存在，无法预演（整次拒绝）："
+                    + ", ".join(f"batch_id={b}" for b in missing)
+                ),
+            )
+        if mismatches:
+            raise HTTPException(
+                status_code=409,
+                detail="档案或批次不匹配，整次预演拒绝：" + "；".join(mismatches),
+            )
+
+        # 对象全部合法后逐批双份重算（同一只读事务/同一读取快照）。
+        # 拟定区间漏采样在此时以 422 中止（事务随异常回滚，无任何写入）。
+        batch_results: list[ProfileCorrectionBatchOut] = []
+        all_case_ids: set[str] = set()
+        all_shipment_ids: set[str] = set()
+        for batch_id in req.batch_ids:
+            stored = stored_by_batch[batch_id]
+            analysis_req = _request_from_stored(stored)
+
+            current_anomalies = _run_detection(
+                analysis_req, current_descriptor
+            )
+            proposed_anomalies = _preview_detection(
+                analysis_req,
+                proposed_descriptor,
+                batch_label=batch_id,
+            )
+
+            current_digest = _analysis_digest(
+                current_anomalies, current_descriptor
+            )
+            proposed_digest = _analysis_digest(
+                proposed_anomalies, proposed_descriptor
+            )
+            digest_changed = current_digest != proposed_digest
+            anomalies_changed = _canonical_anomaly_json(
+                current_anomalies
+            ) != _canonical_anomaly_json(proposed_anomalies)
+
+            affected_cases: list[str] = []
+            affected_shipments: list[str] = []
+            if digest_changed:
+                # 只列出绑定旧摘要的案件；其关联联单通过案件行反查，
+                # 等价于联单批次行中记录了该旧摘要的联单。
+                affected_cases = db.get_case_ids_bound_to_digest(
+                    conn, batch_id, current_digest
+                )
+                affected_shipments = db.get_shipment_ids_for_cases(
+                    conn, affected_cases
+                )
+                all_case_ids.update(affected_cases)
+                all_shipment_ids.update(affected_shipments)
+
+            batch_results.append(
+                ProfileCorrectionBatchOut(
+                    batch_id=batch_id,
+                    device_id=stored["batch"]["device_id"],
+                    current=DigestSnapshotOut(
+                        analysis_digest=current_digest,
+                        anomaly_count=len(current_anomalies),
+                    ),
+                    proposed=DigestSnapshotOut(
+                        analysis_digest=proposed_digest,
+                        anomaly_count=len(proposed_anomalies),
+                    ),
+                    digest_changed=digest_changed,
+                    anomalies_changed=anomalies_changed,
+                    affected_case_ids=affected_cases,
+                    affected_shipment_ids=affected_shipments,
+                )
+            )
+
+        return ProfileCorrectionPreviewResponse(
+            profile_id=req.profile_id,
+            device_id=device_id,
+            intervals=[
+                CalibrationIntervalOut(
+                    start=from_epoch(to_epoch(iv.start)),
+                    end=from_epoch(to_epoch(iv.end)),
+                    scale=iv.scale,
+                    offset=iv.offset,
+                )
+                for iv in req.intervals
+            ],
+            batches=batch_results,
+            affected_case_ids=sorted(all_case_ids),
+            affected_shipment_ids=sorted(all_shipment_ids),
+        )

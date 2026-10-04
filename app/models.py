@@ -7,11 +7,31 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SegmentType = Literal["loading", "unloading", "transport"]
+
+# 各类业务标识（批次/档案/案件/联单）统一约束：非空、最长 128
+BusinessId = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+def _order_and_validate_intervals(
+    intervals: list["CalibrationIntervalIn"],
+) -> list["CalibrationIntervalIn"]:
+    """档案/拟定档案生效区间的建档规则：按 start 排序、end>start、互不重叠
+    （允许首尾相接）。返回排序后的区间列表，供调用方回写模型。"""
+    ordered = sorted(intervals, key=lambda iv: to_epoch(iv.start))
+    for index, iv in enumerate(ordered, start=1):
+        start, end = to_epoch(iv.start), to_epoch(iv.end)
+        if end <= start:
+            raise ValueError(f"校准区间 {index} 的 end 必须晚于 start")
+        if index > 1:
+            prev_end = to_epoch(ordered[index - 2].end)
+            if prev_end > start:
+                raise ValueError(f"校准区间 {index - 1} 与 {index} 时间重叠")
+    return ordered
 
 
 def to_epoch(dt: datetime) -> float:
@@ -78,15 +98,7 @@ class CalibrationProfileIn(BaseModel):
 
     @model_validator(mode="after")
     def _validate_intervals(self) -> "CalibrationProfileIn":
-        ordered = sorted(self.intervals, key=lambda iv: to_epoch(iv.start))
-        for index, iv in enumerate(ordered, start=1):
-            start, end = to_epoch(iv.start), to_epoch(iv.end)
-            if end <= start:
-                raise ValueError(f"校准区间 {index} 的 end 必须晚于 start")
-            if index > 1:
-                prev_end = to_epoch(ordered[index - 2].end)
-                if prev_end > start:
-                    raise ValueError(f"校准区间 {index - 1} 与 {index} 时间重叠")
+        ordered = _order_and_validate_intervals(self.intervals)
         object.__setattr__(self, "intervals", ordered)
         return self
 
@@ -326,3 +338,95 @@ class ShipmentSnapshotResponse(BaseModel):
         ..., description="总体结果：全部案件 closed 为 released；存在 open 案件为 held"
     )
     batches: list[ShipmentBatchOut]
+
+
+# ---------- 校准档案更正预演（只读） ----------
+
+
+class ProfileCorrectionPreviewRequest(BaseModel):
+    """校准档案更正预演提交：已有档案号 + 拟定生效区间 + 该档案下的批次清单。
+
+    拟定区间遵循原建档规则（按 start 排序、互不重叠（允许首尾相接）的
+    [start,end) 区间，每段有限正 scale/offset）；batch_id 为该档案下
+    1～20 个不重复批次。预演为只读操作，不修改任何档案、批次、处置与联单。
+    """
+
+    profile_id: BusinessId = Field(
+        ...,
+        description="拟更正的已有校准档案号；不存在整次拒绝",
+    )
+    intervals: list[CalibrationIntervalIn] = Field(
+        ..., min_length=1,
+        description="拟替换的生效区间（至少 1 段），规则与建档完全一致",
+    )
+    batch_ids: list[BusinessId] = Field(
+        ..., min_length=1, max_length=20,
+        description="该档案下需预演核对的批次清单（1～20 个，不可重复）",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ProfileCorrectionPreviewRequest":
+        ordered = _order_and_validate_intervals(self.intervals)
+        object.__setattr__(self, "intervals", ordered)
+        if len(set(self.batch_ids)) != len(self.batch_ids):
+            raise ValueError("batch_ids 不能重复")
+        return self
+
+
+class DigestSnapshotOut(BaseModel):
+    analysis_digest: str
+    anomaly_count: int
+
+
+class ProfileCorrectionBatchOut(BaseModel):
+    batch_id: str
+    device_id: str
+    current: "DigestSnapshotOut" = Field(
+        ..., description="按原档案（库中不可变档案）重算的结果",
+    )
+    proposed: "DigestSnapshotOut" = Field(
+        ..., description="按拟定档案（新区间）重算的结果",
+    )
+    digest_changed: bool = Field(
+        ...,
+        description=(
+            "analysis_digest 是否变化；即使异常列表完全一致，档案内容变化"
+            "导致摘要变化也为 true。仅为 true 时下面两个清单非空。"
+        ),
+    )
+    anomalies_changed: bool = Field(
+        ..., description="重算后的异常列表（数量或内容）是否变化",
+    )
+    affected_case_ids: list[str] = Field(
+        ...,
+        description=(
+            "绑定旧摘要（current.analysis_digest）的案件 case_id，"
+            "按字典序排序去重；digest 未变化时为空数组"
+        ),
+    )
+    affected_shipment_ids: list[str] = Field(
+        ...,
+        description=(
+            "关联上述案件/旧摘要的运输联单 shipment_id，按字典序排序去重；"
+            "digest 未变化时为空数组"
+        ),
+    )
+
+
+class ProfileCorrectionPreviewResponse(BaseModel):
+    profile_id: str
+    device_id: str
+    intervals: list[CalibrationIntervalOut] = Field(
+        ..., description="拟替换的生效区间（按开始时间排序后原样返回）",
+    )
+    batches: list[ProfileCorrectionBatchOut] = Field(
+        ..., description="按提交 batch_ids 的顺序逐项给出两份重算结果",
+    )
+    affected_case_ids: list[str] = Field(
+        ...,
+        description="本次预演全部受影响 case_id 的并集，按字典序排序去重",
+    )
+    affected_shipment_ids: list[str] = Field(
+        ...,
+        description="本次预演全部受影响 shipment_id 的并集，按字典序排序去重",
+    )

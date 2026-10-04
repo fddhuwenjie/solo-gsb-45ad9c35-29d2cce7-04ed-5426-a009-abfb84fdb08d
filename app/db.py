@@ -474,6 +474,40 @@ def get_profile(profile_id: str) -> Optional[dict[str, Any]]:
     return result
 
 
+# ---------- 校准档案更正预演（只读） ----------
+
+
+def get_case_ids_bound_to_digest(
+    conn: sqlite3.Connection, batch_id: str, analysis_digest: str
+) -> list[str]:
+    """事务内查询绑定指定批次旧摘要的案件号（排序去重）。
+
+    只有案件处置依据的摘要等于旧摘要，档案更正后才会过期、需要重新核对；
+    依据更早/其他快照的案件不在本次影响面内。
+    """
+    rows = conn.execute(
+        """SELECT DISTINCT case_id FROM cases
+           WHERE batch_id = ? AND analysis_digest = ? ORDER BY case_id""",
+        (batch_id, analysis_digest),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_shipment_ids_for_cases(
+    conn: sqlite3.Connection, case_ids: list[str]
+) -> list[str]:
+    """事务内查询关联指定案件集合的联单号（排序去重）。"""
+    if not case_ids:
+        return []
+    placeholders = ",".join("?" for _ in case_ids)
+    rows = conn.execute(
+        f"""SELECT DISTINCT shipment_id FROM shipment_batches
+            WHERE case_id IN ({placeholders}) ORDER BY shipment_id""",
+        case_ids,
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def save_profile(
     conn: sqlite3.Connection,
     profile_id: str,

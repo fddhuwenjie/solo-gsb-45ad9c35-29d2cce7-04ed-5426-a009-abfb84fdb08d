@@ -22,6 +22,10 @@
   （有限正 `scale`/`offset`），分析可选按档案以 `corrected=raw*scale+offset`
   校准后再检测；档案标识与内容进入请求哈希与 `analysis_digest`，历史回放、
   处置复核与联单核对始终基于同一份不可变档案
+- 🧪 档案更正预演（只读）：拟更正档案前提交拟定生效区间与 1～20 个该档案下
+  的批次，服务在**同一 SQLite 读取快照**内用原档案与拟定档案分别重算，按
+  批次给出两份摘要/异常数与变化标记，并列出需重新核对的处置案件与运输联单；
+  预演不修改任何数据
 - 🗄️ SQLite 持久化（WAL 模式），无外部服务依赖
 - 📦 本地依赖：所有 wheel 在 `vendor/` 内，镜像构建**不需要访问外网 PyPI**
 
@@ -40,6 +44,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/batches/analyze | 提交分析（POST） |
 | http://localhost:8000/api/v1/batches/{batch_id} | 回放批次结果（GET） |
 | http://localhost:8000/api/v1/calibration-profiles | 设备温度校准档案（POST） |
+| http://localhost:8000/api/v1/calibration-profiles/correction-preview | 档案更正预演，只读（POST） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
 | http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
 
@@ -304,6 +309,99 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
   完全沿用旧口径，峰值为原始温度，`request_hash` 与 `analysis_digest`
   与升级前逐字节一致。
 
+## 校准档案更正预演（只读）
+
+档案不可变更，但设备复校后需要用新的生效区间替换旧档案。正式更正前，调用
+`POST /api/v1/calibration-profiles/correction-preview` **预演**哪些已完成的
+处置案件与运输联单会因摘要变化而需要重新核对。请求给出已有 `profile_id`、
+拟替换的生效区间（**遵循原建档规则**：按时间排序、互不重叠（允许首尾相接）
+的 `[start,end)` 区间、每段有限正 `scale`/`offset`）以及该档案下 **1～20 个
+不重复** `batch_id`：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/calibration-profiles/correction-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "profile_id": "CAL-2026-Q3-007",
+    "intervals": [
+      {"start": "2026-09-01T00:00:00Z", "end": "2026-09-22T12:00:00Z",
+       "scale": 1.00, "offset": 0.60},
+      {"start": "2026-09-22T12:00:00Z", "end": "2026-10-01T00:00:00Z",
+       "scale": 1.02, "offset": 0.10}
+    ],
+    "batch_ids": ["TRIP-CAL-001", "TRIP-CAL-002"]
+  }'
+```
+
+服务在**同一 SQLite 事务读取快照**内，对每个批次依据入库时保存的原始采样与
+区段，分别用**原档案**（库中不可变档案）与**拟定档案**（`profile_id` 不变、
+区间替换）重算异常与 `analysis_digest`，按提交顺序逐批返回两份摘要、异常数
+与变化标记。**只对摘要变化的批次**，列出绑定旧摘要（`current.analysis_digest`）
+的 `case_id` 及这些案件关联的 `shipment_id`，两个清单各自按字典序排序去重；
+顶层再给出全部受影响案件/联单的并集。
+
+```json
+{
+  "profile_id": "CAL-2026-Q3-007",
+  "device_id": "reefer-A-17",
+  "intervals": [
+    {"start": "2026-09-01T00:00:00.000Z", "end": "2026-09-22T12:00:00.000Z",
+     "scale": 1.00, "offset": 0.60},
+    {"start": "2026-09-22T12:00:00.000Z", "end": "2026-10-01T00:00:00.000Z",
+     "scale": 1.02, "offset": 0.10}
+  ],
+  "batches": [
+    {
+      "batch_id": "TRIP-CAL-001",
+      "device_id": "reefer-A-17",
+      "current":  {"analysis_digest": "a1f9…", "anomaly_count": 1},
+      "proposed": {"analysis_digest": "c82d…", "anomaly_count": 1},
+      "digest_changed": true,
+      "anomalies_changed": true,
+      "affected_case_ids": ["CASE-2026-09-22-01"],
+      "affected_shipment_ids": ["SHP-2026-09-22-01"]
+    },
+    {
+      "batch_id": "TRIP-CAL-002",
+      "device_id": "reefer-A-17",
+      "current":  {"analysis_digest": "77be…", "anomaly_count": 0},
+      "proposed": {"analysis_digest": "9f10…", "anomaly_count": 0},
+      "digest_changed": true,
+      "anomalies_changed": false,
+      "affected_case_ids": ["CASE-2026-09-23-02"],
+      "affected_shipment_ids": []
+    }
+  ],
+  "affected_case_ids": ["CASE-2026-09-22-01", "CASE-2026-09-23-02"],
+  "affected_shipment_ids": ["SHP-2026-09-22-01"]
+}
+```
+
+预演字段与语义：
+
+| 字段 | 说明 |
+| --- | --- |
+| `current` | 按**原档案**重算的 `analysis_digest` 与异常数，与该批次 GET/幂等回放结果一致 |
+| `proposed` | 按**拟定区间**重算的摘要与异常数 |
+| `digest_changed` | 两份摘要是否不同。**即使异常列表逐条一致，档案内容（区间边界/系数）变化导致摘要变化也为 `true`**——摘要输入含 `profile` 描述 |
+| `anomalies_changed` | 重算后的异常列表（数量或任一字段）是否不同 |
+| `affected_case_ids` | 绑定**旧摘要**的案件（档案更正后其处置依据即过期，需重新核对）；摘要未变时为空数组。绑定其他/更早摘要的案件不列入 |
+| `affected_shipment_ids` | 上述案件所在联单（联单批次行记录了旧摘要）；同样排序去重 |
+
+错误码（任一问题整次拒绝，不做任何写入）：
+
+- **档案不存在 `409`**：`profile_id` 在库中不存在，详情指出该档案号。
+- **批次不存在 `404`**：`batch_ids` 中任一批次不存在，详情列出全部缺失批次号。
+- **档案/批次不匹配 `409`**：批次绑定的是其他 `profile_id`，或批次的
+  `device_id` 与档案设备不一致；详情指出对应批次与实际归属。
+- **拟定区间漏掉采样 `422`**：任一批次的任一采样时刻不被拟定区间的任何
+  `[start,end)` 覆盖（含落在右端点上），详情指出批次与采样时刻。
+- **请求结构 `422`**：区间重叠、`end <= start`、系数非有限正数、区间列表为空；
+  `batch_ids` 为空、超过 20 个或存在重复。
+
+预演为**只读**操作：不修改档案、批次与已存异常行、案件处置和联单，重复调用
+结果一致；现有分析、档案提交、处置复核、联单接口及其幂等行为完全保持可用。
+
 ## 处置复核（绑定分析快照）
 
 处置接口为 `POST /api/v1/cases/review`。客户端先做分析、拿到
@@ -494,7 +592,10 @@ curl -X POST http://localhost:8000/api/v1/shipments/snapshot \
 - 区间时间重叠、`end <= start`（首尾相接允许）、空区间列表
 - `scale` / `offset` 不是有限正数（0、负数、Infinity、NaN 均拒绝）
 
-档案不存在或档案与 `device_id` 不匹配返回 `409`。
+档案更正预演请求同样适用上述区间与系数校验，另要求 `batch_ids` 为 1～20 个
+不重复批次；拟定区间漏掉任一批次的任一采样时刻返回 `422`（指出批次与时刻）。
+
+档案不存在或档案与 `device_id` 不匹配返回 `409`；预演中批次不存在返回 `404`。
 
 ## 本地开发（不使用 Docker）
 
@@ -522,11 +623,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、复核/联单事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、更正预演、复核/联单事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因/校准算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
 │   └── db.py          # SQLite 连接、建表、批次/案件/联单/档案读写与事务
-├── tests/             # unittest 算法与 API 测试（86 个用例，含校准档案、快照绑定、复核与联单幂等）
+├── tests/             # unittest 算法与 API 测试（99 个用例，含校准档案、更正预演、快照绑定、复核与联单幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装
